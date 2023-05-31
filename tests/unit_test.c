@@ -4079,7 +4079,7 @@ const char *tests_run(const char *filter) {
 
   RUN_TEST_MJS(test_dataview);
 
-  //RUN_TEST_MJS(test_lib_math);
+  RUN_TEST_MJS(test_lib_math);
   RUN_TEST(test_exec);
 
   RUN_TEST_MJS(test_s2o);
