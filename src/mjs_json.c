@@ -171,26 +171,31 @@ MJS_PRIVATE mjs_err_t to_json_or_debug(struct mjs *mjs, mjs_val_t v, char *buf,
     case MJS_TYPE_OBJECT_FUNCTION:
     case MJS_TYPE_OBJECT_GENERIC: {
       char *b = buf;
-      struct mjs_property *prop = NULL;
-      struct mjs_object *o = NULL;
 
       mbuf_append(&mjs->json_visited_stack, (char *) &v, sizeof(v));
       b += c_snprintf(b, BUF_LEFT(size, b - buf), "{");
-      o = get_object_struct(v);
-      for (prop = o->properties; prop != NULL; prop = prop->next) {
+
+      mjs_val_t iterator = MJS_UNDEFINED;
+      for (;;) {
+        mjs_val_t key = mjs_next_node(mjs, v, &iterator);
+        if (key == MJS_UNDEFINED) {
+          break;
+        }
+
+        struct mjs_node *leaf = (struct mjs_node*)get_ptr(iterator);
         size_t n;
         const char *s;
-        if (!is_debug && should_skip_for_json(mjs_get_type(prop->value))) {
+        if (!is_debug && should_skip_for_json(mjs_get_type(leaf->value))) {
           continue;
         }
         if (b - buf != 1) { /* Not the first property to be printed */
           b += c_snprintf(b, BUF_LEFT(size, b - buf), ",");
         }
-        s = mjs_get_string(mjs, &prop->name, &n);
+        s = mjs_get_string(mjs, &leaf->name, &n);
         b += c_snprintf(b, BUF_LEFT(size, b - buf), "\"%.*s\":", (int) n, s);
         {
           size_t tmp = 0;
-          rcode = to_json_or_debug(mjs, prop->value, b, BUF_LEFT(size, b - buf),
+          rcode = to_json_or_debug(mjs, leaf->value, b, BUF_LEFT(size, b - buf),
                                    &tmp, is_debug);
           if (rcode != MJS_OK) {
             goto clean_iter;

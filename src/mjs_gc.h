@@ -35,7 +35,7 @@ MJS_PRIVATE int gc_strings_is_gc_needed(struct mjs *mjs);
 MJS_PRIVATE int maybe_gc(struct mjs *mjs);
 
 MJS_PRIVATE struct mjs_object *new_object(struct mjs *);
-MJS_PRIVATE struct mjs_property *new_property(struct mjs *);
+MJS_PRIVATE struct mjs_node *new_node(struct mjs *);
 MJS_PRIVATE struct mjs_ffi_sig *new_ffi_sig(struct mjs *mjs);
 
 MJS_PRIVATE void gc_mark(struct mjs *mjs, mjs_val_t *val);

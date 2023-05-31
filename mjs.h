@@ -123,6 +123,7 @@ typedef enum mjs_err {
   MJS_INTERNAL_ERROR,
   MJS_NOT_IMPLEMENTED_ERROR,
   MJS_FILE_READ_ERROR,
+  MJS_FILE_WRITE_ERROR,
   MJS_BAD_ARGS_ERROR,
 
   MJS_ERRS_CNT
@@ -440,6 +441,7 @@ typedef enum mjs_err {
   MJS_INTERNAL_ERROR,
   MJS_NOT_IMPLEMENTED_ERROR,
   MJS_FILE_READ_ERROR,
+  MJS_FILE_WRITE_ERROR,
   MJS_BAD_ARGS_ERROR,
 
   MJS_ERRS_CNT
@@ -613,9 +615,11 @@ extern "C" {
 #endif /* __cplusplus */
 
 mjs_err_t mjs_exec(struct mjs *, const char *src, mjs_val_t *res);
-mjs_err_t mjs_exec_buf(struct mjs *, const char *src, size_t, mjs_val_t *res);
 
+mjs_err_t mjs_load_file(struct mjs *mjs, const char *path);
+mjs_err_t mjs_save_jsc(struct mjs *mjs, const char *path);
 mjs_err_t mjs_exec_file(struct mjs *mjs, const char *path, mjs_val_t *res);
+mjs_err_t mjs_exec_jsc(struct mjs *mjs, const char *path, mjs_val_t *res);
 mjs_err_t mjs_apply(struct mjs *mjs, mjs_val_t *res, mjs_val_t func,
                     mjs_val_t this_val, int nargs, mjs_val_t *args);
 mjs_err_t mjs_call(struct mjs *mjs, mjs_val_t *res, mjs_val_t func,

@@ -45,8 +45,8 @@ MJS_PRIVATE struct mjs_object *new_object(struct mjs *mjs) {
   return (struct mjs_object *) gc_alloc_cell(mjs, &mjs->object_arena);
 }
 
-MJS_PRIVATE struct mjs_property *new_property(struct mjs *mjs) {
-  return (struct mjs_property *) gc_alloc_cell(mjs, &mjs->property_arena);
+MJS_PRIVATE struct mjs_node *new_node(struct mjs *mjs) {
+  return (struct mjs_node *) gc_alloc_cell(mjs, &mjs->node_arena);
 }
 
 MJS_PRIVATE struct mjs_ffi_sig *new_ffi_sig(struct mjs *mjs) {
@@ -278,13 +278,9 @@ static void gc_mark_ffi_sig(struct mjs *mjs, mjs_val_t *v) {
 
 /* Mark an object */
 static void gc_mark_object(struct mjs *mjs, mjs_val_t *v) {
-  struct mjs_object *obj_base;
-  struct mjs_property *prop;
-  struct mjs_property *next;
-
   assert(mjs_is_object(*v));
 
-  obj_base = get_object_struct(*v);
+  struct mjs_object *obj_base = get_object_struct(*v);
 
   /*
    * we treat all object like things like objects but they might be functions,
@@ -297,17 +293,53 @@ static void gc_mark_object(struct mjs *mjs, mjs_val_t *v) {
   if (MARKED(obj_base)) return;
 
   /* mark object itself, and its properties */
-  for ((prop = obj_base->properties), MARK(obj_base); prop != NULL;
-       prop = next) {
-    if (!gc_check_ptr(&mjs->property_arena, prop)) {
-      abort();
+  struct mjs_node *x = obj_base->tree;
+  size_t prop_count = obj_base->prop_count;
+  uintptr_t encoded_x;
+  MARK(obj_base);
+
+  switch (prop_count) {
+  case 0:
+    break;
+  case 1:
+    gc_mark(mjs, &x->name);
+    gc_mark(mjs, &x->value);
+    MARK(x);
+    break;
+  default:
+    do {
+      encoded_x = x->child[0];
+      x = DECODE_NODE(encoded_x);
+    } while (IS_INNER_NODE(encoded_x));
+
+    for (;;) {
+      gc_mark(mjs, &x->name);
+      gc_mark(mjs, &x->value);
+
+      struct mjs_node *y;
+      for (;;) {
+        y = x->parent;
+        MARK(x);
+        if (y == NULL) {
+          goto OUT;
+        }
+        if (encoded_x == y->child[0]) {
+          break;
+        }
+        x = y;
+        encoded_x = ENCODE_INNER_NODE(x);
+      }
+
+      encoded_x = y->child[1];
+      x = DECODE_NODE(encoded_x);
+      while (IS_INNER_NODE(encoded_x)) {
+        encoded_x = x->child[0];
+        x = DECODE_NODE(encoded_x);
+      }
     }
 
-    gc_mark(mjs, &prop->name);
-    gc_mark(mjs, &prop->value);
-
-    next = prop->next;
-    MARK(prop);
+    OUT:
+      ;
   }
 
   /* mark object's prototype */
@@ -500,7 +532,7 @@ void mjs_gc(struct mjs *mjs, int full) {
   gc_compact_strings(mjs);
 
   gc_sweep(mjs, &mjs->object_arena, 0);
-  gc_sweep(mjs, &mjs->property_arena, 0);
+  gc_sweep(mjs, &mjs->node_arena, 0);
   gc_sweep(mjs, &mjs->ffi_sig_arena, 0);
 
   if (full) {

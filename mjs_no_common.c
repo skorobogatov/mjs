@@ -266,6 +266,7 @@ typedef enum mjs_err {
   MJS_INTERNAL_ERROR,
   MJS_NOT_IMPLEMENTED_ERROR,
   MJS_FILE_READ_ERROR,
+  MJS_FILE_WRITE_ERROR,
   MJS_BAD_ARGS_ERROR,
 
   MJS_ERRS_CNT
@@ -774,7 +775,7 @@ MJS_PRIVATE int gc_strings_is_gc_needed(struct mjs *mjs);
 MJS_PRIVATE int maybe_gc(struct mjs *mjs);
 
 MJS_PRIVATE struct mjs_object *new_object(struct mjs *);
-MJS_PRIVATE struct mjs_property *new_property(struct mjs *);
+MJS_PRIVATE struct mjs_node *new_node(struct mjs *);
 MJS_PRIVATE struct mjs_ffi_sig *new_ffi_sig(struct mjs *mjs);
 
 MJS_PRIVATE void gc_mark(struct mjs *mjs, mjs_val_t *val);
@@ -928,7 +929,7 @@ struct mjs {
   size_t cur_bcode_offset;
 
   struct gc_arena object_arena;
-  struct gc_arena property_arena;
+  struct gc_arena node_arena;
   struct gc_arena ffi_sig_arena;
 
   unsigned inhibit_gc : 1;
@@ -1155,25 +1156,55 @@ extern "C" {
 
 struct mjs;
 
-struct mjs_property {
-  struct mjs_property *next; /* Linkage in struct mjs_object::properties */
-  mjs_val_t name;            /* Property name (a string) */
-  mjs_val_t value;           /* Property value */
+struct mjs_position {
+    uint32_t mask : 8;
+    uint32_t byte : 24;
 };
 
+#define POSITION_LESS(a, b) \
+  ((a).byte < (b).byte || ((a).byte == (b).byte && (a).mask > (b).mask))
+
+struct mjs_node {
+  struct mjs_node *parent;
+  union {
+    struct {
+      uintptr_t child[2];
+      struct mjs_position pos;
+    };
+    struct {
+      mjs_val_t name;   /* Property name (a string) */
+      mjs_val_t value;  /* Property value */
+    };
+  };
+};
+
+#define IS_INNER_NODE(child) (((child) & 1) != 0)
+
+#define IS_LEAF_NODE(child) (((child) & 1) == 0)
+
+#define DECODE_NODE(child) ((struct mjs_node*)((child) & (uintptr_t)~1))
+
+#define ENCODE_INNER_NODE(node) ((uintptr_t)(node) | 1)
+
+#define ENCODE_LEAF_NODE(node) ((uintptr_t)(node))
+
 struct mjs_object {
-  struct mjs_property *properties;
+  struct mjs_node *tree;
+  size_t prop_count;
 };
 
 MJS_PRIVATE struct mjs_object *get_object_struct(mjs_val_t v);
-MJS_PRIVATE struct mjs_property *mjs_get_own_property(struct mjs *mjs,
-                                                      mjs_val_t obj,
-                                                      const char *name,
-                                                      size_t len);
 
-MJS_PRIVATE struct mjs_property *mjs_get_own_property_v(struct mjs *mjs,
-                                                        mjs_val_t obj,
-                                                        mjs_val_t key);
+MJS_PRIVATE struct mjs_node *mjs_get_own_node(struct mjs *mjs,
+                                              mjs_val_t obj,
+                                              const char *name,
+                                              size_t name_len);
+
+MJS_PRIVATE struct mjs_node *mjs_get_own_node_v(struct mjs *mjs,
+                                                mjs_val_t obj,
+                                                mjs_val_t key);
+
+mjs_val_t mjs_next_node(struct mjs *mjs, mjs_val_t obj, mjs_val_t *iterator);
 
 /*
  * A worker function for `mjs_set()` and `mjs_set_v()`: it takes name as both
@@ -1542,8 +1573,11 @@ extern "C" {
 
 struct mjs_bcode_part;
 
+#if MJS_ENABLE_DEBUG
 MJS_PRIVATE const char *opcodetostr(uint8_t opcode);
 MJS_PRIVATE size_t mjs_disasm_single(const uint8_t *code, size_t i);
+#endif
+
 MJS_PRIVATE const char *mjs_stringify_type(enum mjs_type t);
 
 /*
@@ -1868,9 +1902,11 @@ extern "C" {
 #endif /* __cplusplus */
 
 mjs_err_t mjs_exec(struct mjs *, const char *src, mjs_val_t *res);
-mjs_err_t mjs_exec_buf(struct mjs *, const char *src, size_t, mjs_val_t *res);
 
+mjs_err_t mjs_load_file(struct mjs *mjs, const char *path);
+mjs_err_t mjs_save_jsc(struct mjs *mjs, const char *path);
 mjs_err_t mjs_exec_file(struct mjs *mjs, const char *path, mjs_val_t *res);
+mjs_err_t mjs_exec_jsc(struct mjs *mjs, const char *path, mjs_val_t *res);
 mjs_err_t mjs_apply(struct mjs *mjs, mjs_val_t *res, mjs_val_t func,
                     mjs_val_t this_val, int nargs, mjs_val_t *args);
 mjs_err_t mjs_call(struct mjs *mjs, mjs_val_t *res, mjs_val_t func,
@@ -2597,15 +2633,15 @@ mjs_val_t mjs_array_get2(struct mjs *mjs, mjs_val_t arr, unsigned long index,
   }
 
   if (mjs_is_object(arr)) {
-    struct mjs_property *p;
+    struct mjs_node *leaf;
     char buf[20];
     int n = v_sprintf_s(buf, sizeof(buf), "%lu", index);
-    p = mjs_get_own_property(mjs, arr, buf, n);
-    if (p != NULL) {
+    leaf = mjs_get_own_node(mjs, arr, buf, n);
+    if (leaf != NULL) {
       if (has != NULL) {
         *has = 1;
       }
-      res = p->value;
+      res = leaf->value;
     }
   }
 
@@ -2613,24 +2649,23 @@ mjs_val_t mjs_array_get2(struct mjs *mjs, mjs_val_t arr, unsigned long index,
 }
 
 unsigned long mjs_array_length(struct mjs *mjs, mjs_val_t v) {
-  struct mjs_property *p;
   unsigned long len = 0;
+  if (mjs_is_object(v)) {
+    mjs_val_t iterator = MJS_UNDEFINED;
+    for (;;) {
+      mjs_val_t key = mjs_next_node(mjs, v, &iterator);
+      if (key == MJS_UNDEFINED) {
+        break;
+      }
 
-  if (!mjs_is_object(v)) {
-    len = 0;
-    goto clean;
-  }
-
-  for (p = get_object_struct(v)->properties; p != NULL; p = p->next) {
-    int ok = 0;
-    unsigned long n = 0;
-    str_to_ulong(mjs, p->name, &ok, &n);
-    if (ok && n >= len && n < 0xffffffff) {
-      len = n + 1;
+      int ok = 0;
+      unsigned long n = 0;
+      str_to_ulong(mjs, key, &ok, &n);
+      if (ok && n >= len && n < 0xffffffff) {
+        len = n + 1;
+      }
     }
   }
-
-clean:
   return len;
 }
 
@@ -3207,8 +3242,8 @@ MJS_PRIVATE int mjs_is_truthy(struct mjs *mjs, mjs_val_t v) {
 #ifndef MJS_OBJECT_ARENA_SIZE
 #define MJS_OBJECT_ARENA_SIZE 20
 #endif
-#ifndef MJS_PROPERTY_ARENA_SIZE
-#define MJS_PROPERTY_ARENA_SIZE 20
+#ifndef MJS_NODE_ARENA_SIZE
+#define MJS_NODE_ARENA_SIZE 40
 #endif
 #ifndef MJS_FUNC_FFI_ARENA_SIZE
 #define MJS_FUNC_FFI_ARENA_SIZE 20
@@ -3217,8 +3252,8 @@ MJS_PRIVATE int mjs_is_truthy(struct mjs *mjs, mjs_val_t v) {
 #ifndef MJS_OBJECT_ARENA_INC_SIZE
 #define MJS_OBJECT_ARENA_INC_SIZE 10
 #endif
-#ifndef MJS_PROPERTY_ARENA_INC_SIZE
-#define MJS_PROPERTY_ARENA_INC_SIZE 10
+#ifndef MJS_NODE_ARENA_INC_SIZE
+#define MJS_NODE_ARENA_INC_SIZE 20
 #endif
 #ifndef MJS_FUNC_FFI_ARENA_INC_SIZE
 #define MJS_FUNC_FFI_ARENA_INC_SIZE 10
@@ -3251,7 +3286,7 @@ void mjs_destroy(struct mjs *mjs) {
   free(mjs->stack_trace);
   mjs_ffi_args_free_list(mjs);
   gc_arena_destroy(mjs, &mjs->object_arena);
-  gc_arena_destroy(mjs, &mjs->property_arena);
+  gc_arena_destroy(mjs, &mjs->node_arena);
   gc_arena_destroy(mjs, &mjs->ffi_sig_arena);
   free(mjs);
 }
@@ -3284,8 +3319,8 @@ struct mjs *mjs_create(void) {
 
   gc_arena_init(&mjs->object_arena, sizeof(struct mjs_object),
                 MJS_OBJECT_ARENA_SIZE, MJS_OBJECT_ARENA_INC_SIZE);
-  gc_arena_init(&mjs->property_arena, sizeof(struct mjs_property),
-                MJS_PROPERTY_ARENA_SIZE, MJS_PROPERTY_ARENA_INC_SIZE);
+  gc_arena_init(&mjs->node_arena, sizeof(struct mjs_node),
+                MJS_NODE_ARENA_SIZE, MJS_NODE_ARENA_INC_SIZE);
   gc_arena_init(&mjs->ffi_sig_arena, sizeof(struct mjs_ffi_sig),
                 MJS_FUNC_FFI_ARENA_SIZE, MJS_FUNC_FFI_ARENA_INC_SIZE);
   mjs->ffi_sig_arena.destructor = mjs_ffi_sig_destructor;
@@ -3377,7 +3412,8 @@ const char *mjs_strerror(struct mjs *mjs, enum mjs_err err) {
   const char *err_names[] = {
       "NO_ERROR",        "SYNTAX_ERROR",    "REFERENCE_ERROR",
       "TYPE_ERROR",      "OUT_OF_MEMORY",   "INTERNAL_ERROR",
-      "NOT_IMPLEMENTED", "FILE_OPEN_ERROR", "BAD_ARGUMENTS"};
+      "NOT_IMPLEMENTED", "FILE_READ_ERROR", "FILE_WRITE_ERROR",
+      "BAD_ARGUMENTS"};
   return mjs->error_msg == NULL || mjs->error_msg[0] == '\0' ? err_names[err]
                                                              : mjs->error_msg;
 }
@@ -3742,7 +3778,7 @@ static mjs_val_t mjs_find_scope(struct mjs *mjs, mjs_val_t key) {
   while (num_scopes > 0) {
     mjs_val_t scope = *vptr(&mjs->scopes, num_scopes - 1);
     num_scopes--;
-    if (mjs_get_own_property_v(mjs, scope, key) != NULL) return scope;
+    if (mjs_get_own_node_v(mjs, scope, key) != NULL) return scope;
   }
   mjs_set_errorf(mjs, MJS_REFERENCE_ERROR, "[%s] is not defined",
                  mjs_get_cstring(mjs, &key));
@@ -4241,7 +4277,9 @@ MJS_PRIVATE mjs_err_t mjs_execute(struct mjs *mjs, size_t off, mjs_val_t *res) {
 #endif
 
     code = (const uint8_t *) bp.data.p;
+#if MJS_ENABLE_DEBUG
     mjs_disasm_single(code, i);
+#endif
     prev_opcode = opcode;
     opcode = code[i];
     switch (opcode) {
@@ -4323,7 +4361,7 @@ MJS_PRIVATE mjs_err_t mjs_execute(struct mjs *mjs, size_t off, mjs_val_t *res) {
       case OP_CREATE: {
         mjs_val_t obj = mjs_pop(mjs);
         mjs_val_t key = mjs_pop(mjs);
-        if (mjs_get_own_property_v(mjs, obj, key) == NULL) {
+        if (mjs_get_own_node_v(mjs, obj, key) == NULL) {
           mjs_set_v(mjs, obj, key, MJS_UNDEFINED);
         }
         break;
@@ -4412,7 +4450,7 @@ MJS_PRIVATE mjs_err_t mjs_execute(struct mjs *mjs, size_t off, mjs_val_t *res) {
         mjs_val_t obj = *vptr(&mjs->stack, -2);
         if (mjs_is_object(obj)) {
           mjs_val_t var_name = *vptr(&mjs->stack, -3);
-          mjs_val_t key = mjs_next(mjs, obj, iterator);
+          mjs_val_t key = mjs_next_node(mjs, obj, iterator);
           if (key != MJS_UNDEFINED) {
             mjs_val_t scope = mjs_find_scope(mjs, var_name);
             mjs_set_v(mjs, scope, var_name, key);
@@ -4733,6 +4771,68 @@ MJS_PRIVATE mjs_err_t mjs_exec_internal(struct mjs *mjs, const char *path,
 
 mjs_err_t mjs_exec(struct mjs *mjs, const char *src, mjs_val_t *res) {
   return mjs_exec_internal(mjs, "<stdin>", src, 0 /* generate_jsc */, res);
+}
+
+mjs_err_t mjs_load_file(struct mjs *mjs, const char *path) {
+  mjs_err_t error;
+  size_t size;
+  char *source_code = cs_read_file(path, &size);
+
+  if (source_code == NULL) {
+    error = MJS_FILE_READ_ERROR;
+    mjs_prepend_errorf(mjs, error, "failed to read file \"%s\"", path);
+  } else {
+    error = mjs->error = mjs_parse(path, source_code, mjs);
+  }
+
+  return error;
+}
+
+mjs_err_t mjs_save_jsc(struct mjs *mjs, const char *path) {
+  mjs_err_t error = MJS_OK;
+
+  int part_index = mjs_bcode_parts_cnt(mjs) - 1;
+  assert(part_index >= 0);
+  struct mjs_bcode_part *bp = mjs_bcode_part_get(mjs, part_index);
+
+  FILE *fp = fopen(path, "wb");
+  if (fp != NULL) {
+    /* write last bcode part to .jsc */
+    fwrite(bp->data.p, bp->data.len, 1, fp);
+    fclose(fp);
+  } else {
+    mjs_err_t error = MJS_FILE_WRITE_ERROR;
+    mjs_prepend_errorf(mjs, error, "failed to write file \"%s\"", path);
+  }
+
+  return error;
+}
+
+mjs_err_t mjs_exec_jsc(struct mjs *mjs, const char *path, mjs_val_t *res) {
+  mjs_err_t error = MJS_OK;
+
+  size_t size;
+  char *bytes = cs_read_file(path, &size);
+  if (bytes == NULL) {
+    error = MJS_FILE_READ_ERROR;
+    mjs_prepend_errorf(mjs, error, "failed to read file \"%s\"", path);
+  } else {
+    mjs_val_t r = MJS_UNDEFINED;
+    size_t off = mjs->bcode_len;
+    struct mjs_bcode_part bp = {
+      .start_idx = off,
+      .data = { bytes, size },
+      .exec_res = MJS_ERRS_CNT
+    };
+    mjs_bcode_part_add(mjs, &bp);
+    mjs->bcode_len += size;
+    mjs_execute(mjs, off, &r);
+    if (res != NULL) {
+      *res = r;
+    }
+  }
+
+  return error;
 }
 
 mjs_err_t mjs_exec_file(struct mjs *mjs, const char *path, mjs_val_t *res) {
@@ -6053,8 +6153,8 @@ MJS_PRIVATE struct mjs_object *new_object(struct mjs *mjs) {
   return (struct mjs_object *) gc_alloc_cell(mjs, &mjs->object_arena);
 }
 
-MJS_PRIVATE struct mjs_property *new_property(struct mjs *mjs) {
-  return (struct mjs_property *) gc_alloc_cell(mjs, &mjs->property_arena);
+MJS_PRIVATE struct mjs_node *new_node(struct mjs *mjs) {
+  return (struct mjs_node *) gc_alloc_cell(mjs, &mjs->node_arena);
 }
 
 MJS_PRIVATE struct mjs_ffi_sig *new_ffi_sig(struct mjs *mjs) {
@@ -6286,13 +6386,9 @@ static void gc_mark_ffi_sig(struct mjs *mjs, mjs_val_t *v) {
 
 /* Mark an object */
 static void gc_mark_object(struct mjs *mjs, mjs_val_t *v) {
-  struct mjs_object *obj_base;
-  struct mjs_property *prop;
-  struct mjs_property *next;
-
   assert(mjs_is_object(*v));
 
-  obj_base = get_object_struct(*v);
+  struct mjs_object *obj_base = get_object_struct(*v);
 
   /*
    * we treat all object like things like objects but they might be functions,
@@ -6305,17 +6401,53 @@ static void gc_mark_object(struct mjs *mjs, mjs_val_t *v) {
   if (MARKED(obj_base)) return;
 
   /* mark object itself, and its properties */
-  for ((prop = obj_base->properties), MARK(obj_base); prop != NULL;
-       prop = next) {
-    if (!gc_check_ptr(&mjs->property_arena, prop)) {
-      abort();
+  struct mjs_node *x = obj_base->tree;
+  size_t prop_count = obj_base->prop_count;
+  uintptr_t encoded_x;
+  MARK(obj_base);
+
+  switch (prop_count) {
+  case 0:
+    break;
+  case 1:
+    gc_mark(mjs, &x->name);
+    gc_mark(mjs, &x->value);
+    MARK(x);
+    break;
+  default:
+    do {
+      encoded_x = x->child[0];
+      x = DECODE_NODE(encoded_x);
+    } while (IS_INNER_NODE(encoded_x));
+
+    for (;;) {
+      gc_mark(mjs, &x->name);
+      gc_mark(mjs, &x->value);
+
+      struct mjs_node *y;
+      for (;;) {
+        y = x->parent;
+        MARK(x);
+        if (y == NULL) {
+          goto OUT;
+        }
+        if (encoded_x == y->child[0]) {
+          break;
+        }
+        x = y;
+        encoded_x = ENCODE_INNER_NODE(x);
+      }
+
+      encoded_x = y->child[1];
+      x = DECODE_NODE(encoded_x);
+      while (IS_INNER_NODE(encoded_x)) {
+        encoded_x = x->child[0];
+        x = DECODE_NODE(encoded_x);
+      }
     }
 
-    gc_mark(mjs, &prop->name);
-    gc_mark(mjs, &prop->value);
-
-    next = prop->next;
-    MARK(prop);
+    OUT:
+      ;
   }
 
   /* mark object's prototype */
@@ -6508,7 +6640,7 @@ void mjs_gc(struct mjs *mjs, int full) {
   gc_compact_strings(mjs);
 
   gc_sweep(mjs, &mjs->object_arena, 0);
-  gc_sweep(mjs, &mjs->property_arena, 0);
+  gc_sweep(mjs, &mjs->node_arena, 0);
   gc_sweep(mjs, &mjs->ffi_sig_arena, 0);
 
   if (full) {
@@ -6716,26 +6848,31 @@ MJS_PRIVATE mjs_err_t to_json_or_debug(struct mjs *mjs, mjs_val_t v, char *buf,
     case MJS_TYPE_OBJECT_FUNCTION:
     case MJS_TYPE_OBJECT_GENERIC: {
       char *b = buf;
-      struct mjs_property *prop = NULL;
-      struct mjs_object *o = NULL;
 
       mbuf_append(&mjs->json_visited_stack, (char *) &v, sizeof(v));
       b += c_snprintf(b, BUF_LEFT(size, b - buf), "{");
-      o = get_object_struct(v);
-      for (prop = o->properties; prop != NULL; prop = prop->next) {
+
+      mjs_val_t iterator = MJS_UNDEFINED;
+      for (;;) {
+        mjs_val_t key = mjs_next_node(mjs, v, &iterator);
+        if (key == MJS_UNDEFINED) {
+          break;
+        }
+
+        struct mjs_node *leaf = (struct mjs_node*)get_ptr(iterator);
         size_t n;
         const char *s;
-        if (!is_debug && should_skip_for_json(mjs_get_type(prop->value))) {
+        if (!is_debug && should_skip_for_json(mjs_get_type(leaf->value))) {
           continue;
         }
         if (b - buf != 1) { /* Not the first property to be printed */
           b += c_snprintf(b, BUF_LEFT(size, b - buf), ",");
         }
-        s = mjs_get_string(mjs, &prop->name, &n);
+        s = mjs_get_string(mjs, &leaf->name, &n);
         b += c_snprintf(b, BUF_LEFT(size, b - buf), "\"%.*s\":", (int) n, s);
         {
           size_t tmp = 0;
-          rcode = to_json_or_debug(mjs, prop->value, b, BUF_LEFT(size, b - buf),
+          rcode = to_json_or_debug(mjs, leaf->value, b, BUF_LEFT(size, b - buf),
                                    &tmp, is_debug);
           if (rcode != MJS_OK) {
             goto clean_iter;
@@ -7074,48 +7211,236 @@ MJS_PRIVATE void mjs_op_json_parse(struct mjs *mjs) {
 /* Amalgamated: #include "mjs_util.h" */
 
 int main(int argc, char *argv[]) {
-  struct mjs *mjs = mjs_create();
-  mjs_val_t res = MJS_UNDEFINED;
-  mjs_err_t err = MJS_OK;
-  int i;
+  if (argc == 1) {
+    printf("mJS (c) Cesanta, built: " __DATE__ "\n");
+    printf("USAGE:\n");
+    printf("  %s [-l level] [-c|-r|-j] file...\n", argv[0]);
+    printf("  %s [-l level] -e string\n", argv[0]);
+    printf("OPTIONS:\n");
+    printf("  -l level     - Set debug level, from 0 to 5\n");
+    printf("  -c           - Compile JavaScript files to .jsc files\n");
+    printf("  -r           - Run bytecode from .jsc files\n");
+    printf("  -j           - Enable code precompiling to .jsc files\n");
+    printf("  -e string    - Execute JavaScript expression\n");
+    return EXIT_SUCCESS;
+  }
 
-  for (i = 1; i < argc && argv[i][0] == '-' && err == MJS_OK; i++) {
-    if (strcmp(argv[i], "-l") == 0 && i + 1 < argc) {
-      cs_log_set_level(atoi(argv[++i]));
-    } else if (strcmp(argv[i], "-j") == 0) {
-      mjs_set_generate_jsc(mjs, 1);
-    } else if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) {
-      err = mjs_exec(mjs, argv[++i], &res);
-    } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
-      err = mjs_exec_file(mjs, argv[++i], &res);
-    } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-      printf("mJS (c) Cesanta, built: " __DATE__ "\n");
-      printf("Usage:\n");
-      printf("%s [OPTIONS] [js_file ...]\n", argv[0]);
-      printf("OPTIONS:\n");
-      printf("  -e string    - Execute JavaScript expression\n");
-      printf("  -j           - Enable code precompiling to .jsc files\n");
-      printf("  -f js_file   - Execute code from .js JavaScript file\n");
-      printf("  -l level     - Set debug level, from 0 to 5\n");
-      return EXIT_SUCCESS;
-    } else {
-      fprintf(stderr, "Unknown flag: [%s]\n", argv[i]);
-      return EXIT_FAILURE;
+  /* Used args mask. */
+  int *mask = calloc(argc, sizeof(int));
+
+  /* Determine and set debug level. */
+  int i, debug_level = -1;
+  char *arg;
+  for (i = 1; i < argc; i++) {
+    arg = argv[i];
+    if (arg[0] == '-' && arg[1] == 'l' && arg[2] == 0) {
+      mask[i] = 1;
+
+      if (i+1 == argc) {
+        printf("debug level number must follow '-l' option\n");
+        goto failure;
+      }
+
+      char *s = argv[++i];
+      char *endptr;
+      int level = (int)strtol(s, &endptr, 10);
+      if (level < 0 || level > 5 || endptr == s || *endptr != 0) {
+        printf("invalid debug level '%s'\n", s);
+        goto failure;
+      }
+
+      mask[i] = 1;
+
+      if (level > debug_level) {
+        debug_level = level;
+      }
     }
   }
-  for (; i < argc && err == MJS_OK; i++) {
-    err = mjs_exec_file(mjs, argv[i], &res);
+
+  if (debug_level != -1) {
+    cs_log_set_level(debug_level);
   }
 
-  if (err == MJS_OK) {
+  /* Search for '-e' option. */
+  char *expr = NULL;
+  for (i = 1; i < argc; i++) {
+    if (mask[i]) {
+      continue;
+    }
+
+    arg = argv[i];
+    if (arg[0] == '-' && arg[1] == 'e' && arg[2] == 0) {
+      mask[i] = 1;
+
+      if (i+1 == argc || mask[i+1]) {
+        printf("JavaScript expression must follow '-e' option\n");
+        goto failure;
+      }
+
+      if (expr) {
+        printf("multiple '-e' options not allowed\n");
+        goto failure;
+      }
+
+      expr = argv[++i];
+      mask[i] = 1;
+    }
+  }
+
+  struct mjs *mjs;
+  mjs_val_t res = MJS_UNDEFINED;
+  mjs_err_t err = MJS_OK;
+
+  if (expr) {
+    /* If expression is present, check for unused arguments first. */
+    for (i = 1; i < argc; i++) {
+      if (mask[i] == 0) {
+        printf("invalid argument '%s'\n", argv[i]);
+        goto failure;
+      }
+    }
+    free(mask);
+
+    /* Execute expression. */
+    mjs = mjs_create();
+    err = mjs_exec(mjs, expr, &res);
+  } else {
+    /* Search for '-c', '-r' and '-j' options. */
+    int compile = 0, run_jsc = 0, precompile = 0;
+    for (i = 1; i < argc; i++) {
+      if (mask[i]) {
+        continue;
+      }
+
+      arg = argv[i];
+      if (arg[0] == '-' && arg[2] == 0) {
+        mask[i] = 1;
+
+        switch (arg[1]) {
+        case 'c':
+          if (compile) {
+            printf("multiple '-c' options not allowed\n");
+            goto failure;
+          }
+          compile = 1;
+          break;
+        case 'r':
+          if (run_jsc) {
+            printf("multiple '-r' options not allowed\n");
+            goto failure;
+          }
+          run_jsc = 1;
+          break;
+        case 'j':
+          if (precompile) {
+            printf("multiple '-j' options not allowed\n");
+            goto failure;
+          }
+          precompile = 1;
+          break;
+        case 'f':
+          /* Obsolete '-f' option will be processed further! */
+          mask[i] = 0;
+          break;
+        default:
+          printf("invalid option '%s'\n", arg);
+          goto failure;
+        }
+      }
+    }
+
+    /* Determine conflicts. */
+    if (compile && run_jsc) {
+      printf("conflicting options '-c' and '-r'\n");
+      goto failure;
+    }
+    if (compile && precompile) {
+      printf("conflicting options '-c' and '-j'\n");
+      goto failure;
+    }
+    if (run_jsc && precompile) {
+      printf("conflicting options '-r' and '-j'\n");
+      goto failure;
+    }
+
+    /* Count files and check extensions of their names.*/
+    const char *jscext = ".jsc";
+    const char *ext = run_jsc ? jscext : ".js";
+    int count = 0;
+    for (i = 1; i < argc; i++) {
+      if (mask[i]) {
+        continue;
+      }
+
+      arg = argv[i];
+      if (arg[0] == '-' && arg[1] == 'f' && arg[2] == 0) {
+        /* Process now obsolete '-f' option. */
+        mask[i] = 1;
+        if (i+1 == argc || mask[i+1]) {
+          printf("file name must follow obsolete '-f' option\n");
+          goto failure;
+        }
+      } else {
+        int basename_len = (int)strlen(arg) - strlen(ext);
+        if (basename_len <= 0 || strcmp(arg + basename_len, ext) != 0) {
+          printf("file name %s must have %s extension\n", arg, ext);
+          goto failure;
+        }
+
+        count++;
+      }
+    }
+
+    if (count == 0) {
+      printf("no input files\n");
+      goto failure;
+    }
+
+    /* Process files. */
+    mjs = mjs_create();
+    if (precompile) {
+      mjs_set_generate_jsc(mjs, 1);
+    }
+
+    for (i = 1; i < argc && err == MJS_OK; i++) {
+      if (mask[i]) {
+        continue;
+      }
+
+      arg = argv[i];
+      if (compile) {
+        err = mjs_load_file(mjs, arg);
+        if (err == MJS_OK) {
+          int basename_len = (int)strlen(arg) - strlen(ext);
+          char *filename_jsc = (char*)malloc(basename_len + strlen(jscext) + 1);
+          memcpy(filename_jsc, arg, basename_len);
+          strcpy(filename_jsc + basename_len, jscext);
+          err = mjs_save_jsc(mjs, filename_jsc);
+          free(filename_jsc);
+        }
+      } else if (run_jsc) {
+        err = mjs_exec_jsc(mjs, arg, &res);
+      } else {
+        err = mjs_exec_file(mjs, arg, &res);
+      }
+    }
+
+    free(mask);
+  }
+
+  /* Print result and destroy context. */
+  if (err != MJS_OK) {
+    mjs_print_error(mjs, stdout, NULL, 1 /* print_stack_trace */);
+  } else if (res != MJS_UNDEFINED) {
     mjs_fprintf(res, mjs, stdout);
     putchar('\n');
-  } else {
-    mjs_print_error(mjs, stdout, NULL, 1 /* print_stack_trace */);
   }
   mjs_destroy(mjs);
-
   return EXIT_SUCCESS;
+
+failure:
+  free(mask);
+  return EXIT_FAILURE;
 }
 #endif
 #ifdef MJS_MODULE_LINES
@@ -7157,7 +7482,8 @@ mjs_val_t mjs_mk_object(struct mjs *mjs) {
     return MJS_NULL;
   }
   (void) mjs;
-  o->properties = NULL;
+  o->tree = NULL;
+  o->prop_count = 0;
   return mjs_object_to_value(o);
 }
 
@@ -7166,73 +7492,78 @@ int mjs_is_object(mjs_val_t v) {
          (v & MJS_TAG_MASK) == MJS_TAG_ARRAY;
 }
 
-MJS_PRIVATE struct mjs_property *mjs_get_own_property(struct mjs *mjs,
-                                                      mjs_val_t obj,
-                                                      const char *name,
-                                                      size_t len) {
-  struct mjs_property *p;
-  struct mjs_object *o;
+MJS_PRIVATE struct mjs_node *mjs_descend(struct mjs_node *x,
+                                         const char *name,
+                                         size_t name_len) {
+  uintptr_t child;
+  do {
+    struct mjs_position pos = x->pos;
+    uint8_t c = pos.byte < name_len ? (uint8_t)(name[pos.byte]) : 0;
+    int dir = (1 + (int)(pos.mask | c)) >> 8;
+    child = x->child[dir];
+    x = DECODE_NODE(child);
+  } while (IS_INNER_NODE(child));
+  return x;
+}
 
+MJS_PRIVATE struct mjs_node *mjs_get_own_node(struct mjs *mjs,
+                                              mjs_val_t obj,
+                                              const char *name,
+                                              size_t name_len) {
   if (!mjs_is_object(obj)) {
     return NULL;
   }
 
-  o = get_object_struct(obj);
+  struct mjs_object *o = get_object_struct(obj);
+  struct mjs_node *leaf;
 
-  if (len <= 5) {
-    mjs_val_t ss = mjs_mk_string(mjs, name, len, 1);
-    for (p = o->properties; p != NULL; p = p->next) {
-      if (p->name == ss) return p;
-    }
-  } else {
-    for (p = o->properties; p != NULL; p = p->next) {
-      if (mjs_strcmp(mjs, &p->name, name, len) == 0) return p;
-    }
-    return p;
+  switch (o->prop_count) {
+  case 0:
+    return 0;
+  case 1:
+    leaf = o->tree;
+    break;
+  default:
+    leaf = mjs_descend(o->tree, name, name_len);
   }
 
-  return NULL;
+  if (name_len <= 5) {
+    mjs_val_t ss = mjs_mk_string(mjs, name, name_len, 1);
+    if (leaf->name != ss) {
+      return NULL;
+    }
+  } else {
+    if (mjs_strcmp(mjs, &leaf->name, name, name_len) != 0) {
+      return NULL;
+    }
+  }
+
+  return leaf;
 }
 
-MJS_PRIVATE struct mjs_property *mjs_get_own_property_v(struct mjs *mjs,
-                                                        mjs_val_t obj,
-                                                        mjs_val_t key) {
+MJS_PRIVATE struct mjs_node *mjs_get_own_node_v(struct mjs *mjs,
+                                                mjs_val_t obj,
+                                                mjs_val_t key) {
   size_t n;
   char *s = NULL;
   int need_free = 0;
-  struct mjs_property *p = NULL;
+  struct mjs_node *leaf = NULL;
   mjs_err_t err = mjs_to_string(mjs, &key, &s, &n, &need_free);
   if (err == MJS_OK) {
-    p = mjs_get_own_property(mjs, obj, s, n);
+    leaf = mjs_get_own_node(mjs, obj, s, n);
   }
   if (need_free) free(s);
-  return p;
-}
-
-MJS_PRIVATE struct mjs_property *mjs_mk_property(struct mjs *mjs,
-                                                 mjs_val_t name,
-                                                 mjs_val_t value) {
-  struct mjs_property *p = new_property(mjs);
-  p->next = NULL;
-  p->name = name;
-  p->value = value;
-  return p;
+  return leaf;
 }
 
 mjs_val_t mjs_get(struct mjs *mjs, mjs_val_t obj, const char *name,
                   size_t name_len) {
-  struct mjs_property *p;
-
   if (name_len == (size_t) ~0) {
     name_len = strlen(name);
   }
 
-  p = mjs_get_own_property(mjs, obj, name, name_len);
-  if (p == NULL) {
-    return MJS_UNDEFINED;
-  } else {
-    return p->value;
-  }
+  struct mjs_node *leaf = mjs_get_own_node(mjs, obj, name, name_len);
+  return leaf == NULL ? MJS_UNDEFINED : leaf->value;
 }
 
 mjs_val_t mjs_get_v(struct mjs *mjs, mjs_val_t obj, mjs_val_t name) {
@@ -7256,11 +7587,18 @@ mjs_val_t mjs_get_v(struct mjs *mjs, mjs_val_t obj, mjs_val_t name) {
 }
 
 mjs_val_t mjs_get_v_proto(struct mjs *mjs, mjs_val_t obj, mjs_val_t key) {
-  struct mjs_property *p;
-  mjs_val_t pn = mjs_mk_string(mjs, MJS_PROTO_PROP_NAME, ~0, 1);
-  if ((p = mjs_get_own_property_v(mjs, obj, key)) != NULL) return p->value;
-  if ((p = mjs_get_own_property_v(mjs, obj, pn)) == NULL) return MJS_UNDEFINED;
-  return mjs_get_v_proto(mjs, p->value, key);
+  mjs_val_t res;
+
+  struct mjs_node *leaf = mjs_get_own_node_v(mjs, obj, key);
+  if (leaf != NULL) {
+    res = leaf->value;
+  } else {
+    mjs_val_t pn = mjs_mk_string(mjs, MJS_PROTO_PROP_NAME, ~0, 1);
+    leaf = mjs_get_own_node_v(mjs, obj, pn);
+    res = leaf ? mjs_get_v_proto(mjs, leaf->value, key) : MJS_UNDEFINED;
+  }
+
+  return res;
 }
 
 mjs_err_t mjs_set(struct mjs *mjs, mjs_val_t obj, const char *name,
@@ -7277,108 +7615,205 @@ mjs_err_t mjs_set_v(struct mjs *mjs, mjs_val_t obj, mjs_val_t name,
 MJS_PRIVATE mjs_err_t mjs_set_internal(struct mjs *mjs, mjs_val_t obj,
                                        mjs_val_t name_v, char *name,
                                        size_t name_len, mjs_val_t val) {
-  mjs_err_t rcode = MJS_OK;
-
-  struct mjs_property *p;
+  if (!mjs_is_object(obj)) {
+    return MJS_REFERENCE_ERROR;
+  }
 
   int need_free = 0;
 
   if (name == NULL) {
     /* Pointer was not provided, so obtain one from the name_v. */
-    rcode = mjs_to_string(mjs, &name_v, &name, &name_len, &need_free);
+    mjs_err_t rcode = mjs_to_string(mjs, &name_v, &name, &name_len, &need_free);
     if (rcode != MJS_OK) {
-      goto clean;
+      return rcode;
     }
   } else {
-    /*
-     * Pointer was provided, so we ignore name_v. Here we set it to undefined,
-     * and the actual value will be calculated later if needed.
-     */
+    if (name_len == ~((size_t)0)) {
+      name_len = strlen(name);
+    }
     name_v = MJS_UNDEFINED;
   }
 
-  p = mjs_get_own_property(mjs, obj, name, name_len);
+  struct mjs_node *leaf, *new_leaf;
+  uintptr_t root;
+  struct mjs_object *o = get_object_struct(obj);
 
-  if (p == NULL) {
-    struct mjs_object *o;
-    if (!mjs_is_object(obj)) {
-      return MJS_REFERENCE_ERROR;
-    }
-
-    /*
-     * name_v might be not a string here. In this case, we need to create a new
-     * `name_v`, which will be a string.
-     */
-    if (!mjs_is_string(name_v)) {
-      name_v = mjs_mk_string(mjs, name, name_len, 1);
-    }
-
-    p = mjs_mk_property(mjs, name_v, val);
-
-    o = get_object_struct(obj);
-    p->next = o->properties;
-    o->properties = p;
+  switch (o->prop_count) {
+  case 0:
+    new_leaf = new_node(mjs);
+    new_leaf->parent = NULL;
+    new_leaf->value = val;
+    o->tree = new_leaf;
+    goto save_name_v;
+  case 1:
+    leaf = o->tree;
+    root = ENCODE_LEAF_NODE(leaf);
+    break;
+  default:
+    leaf = mjs_descend(o->tree, name, name_len);
+    root = ENCODE_INNER_NODE(o->tree);
   }
 
-  p->value = val;
+  size_t leaf_name_len;
+  const char *leaf_name = mjs_get_string(mjs, &leaf->name, &leaf_name_len);
+
+  size_t min_len = name_len < leaf_name_len ? name_len : leaf_name_len;
+  size_t byte = 0;
+  while (byte < min_len && name[byte] == leaf_name[byte]) {
+    byte++;
+  }
+
+  if (byte == min_len && name_len == leaf_name_len) {
+    leaf->value = val;
+    goto clean;
+  }
+
+  uint8_t c = byte < name_len ? name[byte] : 0;
+  uint8_t leaf_c = byte < leaf_name_len ? leaf_name[byte] : 0;
+
+  int n = __builtin_ctz(c ^ leaf_c);
+  struct mjs_position new_pos = { ~(1 << n), byte };
+  int new_dir = (leaf_c >> n) & 1;
+
+  struct mjs_node *new_inner_node = new_node(mjs);
+  new_inner_node->pos = new_pos;
+
+  new_leaf = new_node(mjs);
+  new_leaf->parent = new_inner_node;
+  new_leaf->value = val;
+
+  new_inner_node->child[1 - new_dir] = ENCODE_LEAF_NODE(new_leaf);
+
+  struct mjs_node *x;
+  uintptr_t *where = &root;
+  while (IS_INNER_NODE(*where)) {
+    struct mjs_node *x = DECODE_NODE(*where);
+    struct mjs_position pos = x->pos;
+    if (POSITION_LESS(new_pos, pos)) {
+      break;
+    }
+
+    c = pos.byte < name_len ? (uint8_t)(name[pos.byte]) : 0;
+    int dir = (1 + (int)(pos.mask | c)) >> 8;
+    where = &(x->child[dir]);
+  }
+
+  new_inner_node->child[new_dir] = *where;
+  x = DECODE_NODE(*where);
+  new_inner_node->parent = x->parent;
+  x->parent = new_inner_node;
+  *where = ENCODE_INNER_NODE(new_inner_node);
+  o->tree = DECODE_NODE(root);
+
+save_name_v:
+  if (!mjs_is_string(name_v)) {
+    /* We intentially convert 'name' into value here, because 'mjs_mk_string'
+       function can reallocate string buffer, thus invalidating the 'name'
+       pointer! */
+    new_leaf->name = mjs_mk_string(mjs, name, name_len, 1);
+  } else {
+    new_leaf->name = name_v;
+  }
+
+  o->prop_count++;
 
 clean:
   if (need_free) {
     free(name);
-    name = NULL;
   }
-  return rcode;
-}
-
-MJS_PRIVATE void mjs_destroy_property(struct mjs_property **p) {
-  *p = NULL;
+  return MJS_OK;
 }
 
 /*
  * See comments in `object_public.h`
  */
 int mjs_del(struct mjs *mjs, mjs_val_t obj, const char *name, size_t len) {
-  struct mjs_property *prop, *prev;
-
   if (!mjs_is_object(obj)) {
     return -1;
   }
+
   if (len == (size_t) ~0) {
     len = strlen(name);
   }
-  for (prev = NULL, prop = get_object_struct(obj)->properties; prop != NULL;
-       prev = prop, prop = prop->next) {
-    size_t n;
-    const char *s = mjs_get_string(mjs, &prop->name, &n);
-    if (n == len && strncmp(s, name, len) == 0) {
-      if (prev) {
-        prev->next = prop->next;
-      } else {
-        get_object_struct(obj)->properties = prop->next;
-      }
-      mjs_destroy_property(&prop);
-      return 0;
-    }
+
+  struct mjs_node *x = mjs_get_own_node(mjs, obj, name, len);
+  if (x == NULL) {
+    return -1;
   }
-  return -1;
+
+  struct mjs_object *o = get_object_struct(obj);
+  struct mjs_node *y = x->parent;
+  if (y == NULL) {
+    o->tree = NULL;
+  } else {
+    int dir = y->child[0] == ENCODE_LEAF_NODE(x) ? 1 : 0;
+    uintptr_t encoded_z = y->child[dir];
+    struct mjs_node *z = DECODE_NODE(encoded_z);
+    struct mjs_node *parent = y->parent;
+    if (parent == NULL) {
+      o->tree = z;
+    } else {
+      dir = parent->child[0] == ENCODE_INNER_NODE(y) ? 0 : 1;
+      parent->child[dir] = encoded_z;
+    }
+    z->parent = parent;
+  }
+  o->prop_count--;
+  return 0;
 }
 
-mjs_val_t mjs_next(struct mjs *mjs, mjs_val_t obj, mjs_val_t *iterator) {
-  struct mjs_property *p = NULL;
+mjs_val_t mjs_next_node(struct mjs *mjs, mjs_val_t obj, mjs_val_t *iterator) {
+  struct mjs_node *x, *y;
+  uintptr_t encoded_x;
   mjs_val_t key = MJS_UNDEFINED;
 
   if (*iterator == MJS_UNDEFINED) {
     struct mjs_object *o = get_object_struct(obj);
-    p = o->properties;
-  } else {
-    p = ((struct mjs_property *) get_ptr(*iterator))->next;
-  }
+    switch (o->prop_count) {
+    case 0:
+      *iterator = MJS_UNDEFINED;
+      break;
+    case 1:
+      key = o->tree->name;
+      *iterator = mjs_mk_foreign(mjs, o->tree);
+      break;
+    default:
+      x = o->tree;
+      do {
+        encoded_x = x->child[0];
+        x = DECODE_NODE(encoded_x);
+      } while (IS_INNER_NODE(encoded_x));
 
-  if (p == NULL) {
-    *iterator = MJS_UNDEFINED;
+      key = x->name;
+      *iterator = mjs_mk_foreign(mjs, x);
+    }
   } else {
-    key = p->name;
-    *iterator = mjs_mk_foreign(mjs, p);
+    x = (struct mjs_node*)get_ptr(*iterator);
+    encoded_x = ENCODE_LEAF_NODE(x);
+
+    for (;;) {
+      y = x->parent;
+      if (y == NULL) {
+        *iterator = MJS_UNDEFINED;
+        break;
+      }
+
+      if (encoded_x == y->child[0]) {
+        encoded_x = y->child[1];
+        x = DECODE_NODE(encoded_x);
+        while (IS_INNER_NODE(encoded_x)) {
+          encoded_x = x->child[0];
+          x = DECODE_NODE(encoded_x);
+        }
+
+        key = x->name;
+        *iterator = mjs_mk_foreign(mjs, x);
+        break;
+      }
+
+      x = y;
+      encoded_x = ENCODE_INNER_NODE(x);
+    }
   }
 
   return key;
@@ -9643,6 +10078,8 @@ void mjs_fprintf(mjs_val_t v, struct mjs *mjs, FILE *fp) {
   mjs_jprintf(v, mjs, &out);
 }
 
+#if MJS_ENABLE_DEBUG
+
 MJS_PRIVATE const char *opcodetostr(uint8_t opcode) {
   static const char *names[] = {
       "NOP", "DROP", "DUP", "SWAP", "JMP", "JMP_TRUE", "JMP_NEUTRAL_TRUE",
@@ -9820,8 +10257,6 @@ void mjs_disasm(const uint8_t *code, size_t len) {
     }
   }
 }
-
-#if MJS_ENABLE_DEBUG
 
 static void mjs_dump_obj_stack(const char *name, const struct mbuf *m,
                                struct mjs *mjs) {

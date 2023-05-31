@@ -53,15 +53,15 @@ mjs_val_t mjs_array_get2(struct mjs *mjs, mjs_val_t arr, unsigned long index,
   }
 
   if (mjs_is_object(arr)) {
-    struct mjs_property *p;
+    struct mjs_node *leaf;
     char buf[20];
     int n = v_sprintf_s(buf, sizeof(buf), "%lu", index);
-    p = mjs_get_own_property(mjs, arr, buf, n);
-    if (p != NULL) {
+    leaf = mjs_get_own_node(mjs, arr, buf, n);
+    if (leaf != NULL) {
       if (has != NULL) {
         *has = 1;
       }
-      res = p->value;
+      res = leaf->value;
     }
   }
 
@@ -69,24 +69,23 @@ mjs_val_t mjs_array_get2(struct mjs *mjs, mjs_val_t arr, unsigned long index,
 }
 
 unsigned long mjs_array_length(struct mjs *mjs, mjs_val_t v) {
-  struct mjs_property *p;
   unsigned long len = 0;
+  if (mjs_is_object(v)) {
+    mjs_val_t iterator = MJS_UNDEFINED;
+    for (;;) {
+      mjs_val_t key = mjs_next_node(mjs, v, &iterator);
+      if (key == MJS_UNDEFINED) {
+        break;
+      }
 
-  if (!mjs_is_object(v)) {
-    len = 0;
-    goto clean;
-  }
-
-  for (p = get_object_struct(v)->properties; p != NULL; p = p->next) {
-    int ok = 0;
-    unsigned long n = 0;
-    str_to_ulong(mjs, p->name, &ok, &n);
-    if (ok && n >= len && n < 0xffffffff) {
-      len = n + 1;
+      int ok = 0;
+      unsigned long n = 0;
+      str_to_ulong(mjs, key, &ok, &n);
+      if (ok && n >= len && n < 0xffffffff) {
+        len = n + 1;
+      }
     }
   }
-
-clean:
   return len;
 }
 

@@ -20,8 +20,8 @@
 #ifndef MJS_OBJECT_ARENA_SIZE
 #define MJS_OBJECT_ARENA_SIZE 20
 #endif
-#ifndef MJS_PROPERTY_ARENA_SIZE
-#define MJS_PROPERTY_ARENA_SIZE 20
+#ifndef MJS_NODE_ARENA_SIZE
+#define MJS_NODE_ARENA_SIZE 40
 #endif
 #ifndef MJS_FUNC_FFI_ARENA_SIZE
 #define MJS_FUNC_FFI_ARENA_SIZE 20
@@ -30,8 +30,8 @@
 #ifndef MJS_OBJECT_ARENA_INC_SIZE
 #define MJS_OBJECT_ARENA_INC_SIZE 10
 #endif
-#ifndef MJS_PROPERTY_ARENA_INC_SIZE
-#define MJS_PROPERTY_ARENA_INC_SIZE 10
+#ifndef MJS_NODE_ARENA_INC_SIZE
+#define MJS_NODE_ARENA_INC_SIZE 20
 #endif
 #ifndef MJS_FUNC_FFI_ARENA_INC_SIZE
 #define MJS_FUNC_FFI_ARENA_INC_SIZE 10
@@ -64,7 +64,7 @@ void mjs_destroy(struct mjs *mjs) {
   free(mjs->stack_trace);
   mjs_ffi_args_free_list(mjs);
   gc_arena_destroy(mjs, &mjs->object_arena);
-  gc_arena_destroy(mjs, &mjs->property_arena);
+  gc_arena_destroy(mjs, &mjs->node_arena);
   gc_arena_destroy(mjs, &mjs->ffi_sig_arena);
   free(mjs);
 }
@@ -97,8 +97,8 @@ struct mjs *mjs_create(void) {
 
   gc_arena_init(&mjs->object_arena, sizeof(struct mjs_object),
                 MJS_OBJECT_ARENA_SIZE, MJS_OBJECT_ARENA_INC_SIZE);
-  gc_arena_init(&mjs->property_arena, sizeof(struct mjs_property),
-                MJS_PROPERTY_ARENA_SIZE, MJS_PROPERTY_ARENA_INC_SIZE);
+  gc_arena_init(&mjs->node_arena, sizeof(struct mjs_node),
+                MJS_NODE_ARENA_SIZE, MJS_NODE_ARENA_INC_SIZE);
   gc_arena_init(&mjs->ffi_sig_arena, sizeof(struct mjs_ffi_sig),
                 MJS_FUNC_FFI_ARENA_SIZE, MJS_FUNC_FFI_ARENA_INC_SIZE);
   mjs->ffi_sig_arena.destructor = mjs_ffi_sig_destructor;
@@ -190,7 +190,8 @@ const char *mjs_strerror(struct mjs *mjs, enum mjs_err err) {
   const char *err_names[] = {
       "NO_ERROR",        "SYNTAX_ERROR",    "REFERENCE_ERROR",
       "TYPE_ERROR",      "OUT_OF_MEMORY",   "INTERNAL_ERROR",
-      "NOT_IMPLEMENTED", "FILE_OPEN_ERROR", "BAD_ARGUMENTS"};
+      "NOT_IMPLEMENTED", "FILE_READ_ERROR", "FILE_WRITE_ERROR",
+      "BAD_ARGUMENTS"};
   return mjs->error_msg == NULL || mjs->error_msg[0] == '\0' ? err_names[err]
                                                              : mjs->error_msg;
 }

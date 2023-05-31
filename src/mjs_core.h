@@ -130,7 +130,7 @@ struct mjs {
   size_t cur_bcode_offset;
 
   struct gc_arena object_arena;
-  struct gc_arena property_arena;
+  struct gc_arena node_arena;
   struct gc_arena ffi_sig_arena;
 
   unsigned inhibit_gc : 1;

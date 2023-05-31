@@ -15,25 +15,55 @@ extern "C" {
 
 struct mjs;
 
-struct mjs_property {
-  struct mjs_property *next; /* Linkage in struct mjs_object::properties */
-  mjs_val_t name;            /* Property name (a string) */
-  mjs_val_t value;           /* Property value */
+struct mjs_position {
+    uint32_t mask : 8;
+    uint32_t byte : 24;
 };
 
+#define POSITION_LESS(a, b) \
+  ((a).byte < (b).byte || ((a).byte == (b).byte && (a).mask > (b).mask))
+
+struct mjs_node {
+  struct mjs_node *parent;
+  union {
+    struct {
+      uintptr_t child[2];
+      struct mjs_position pos;
+    };
+    struct {
+      mjs_val_t name;   /* Property name (a string) */
+      mjs_val_t value;  /* Property value */
+    };
+  };
+};
+
+#define IS_INNER_NODE(child) (((child) & 1) != 0)
+
+#define IS_LEAF_NODE(child) (((child) & 1) == 0)
+
+#define DECODE_NODE(child) ((struct mjs_node*)((child) & (uintptr_t)~1))
+
+#define ENCODE_INNER_NODE(node) ((uintptr_t)(node) | 1)
+
+#define ENCODE_LEAF_NODE(node) ((uintptr_t)(node))
+
 struct mjs_object {
-  struct mjs_property *properties;
+  struct mjs_node *tree;
+  size_t prop_count;
 };
 
 MJS_PRIVATE struct mjs_object *get_object_struct(mjs_val_t v);
-MJS_PRIVATE struct mjs_property *mjs_get_own_property(struct mjs *mjs,
-                                                      mjs_val_t obj,
-                                                      const char *name,
-                                                      size_t len);
 
-MJS_PRIVATE struct mjs_property *mjs_get_own_property_v(struct mjs *mjs,
-                                                        mjs_val_t obj,
-                                                        mjs_val_t key);
+MJS_PRIVATE struct mjs_node *mjs_get_own_node(struct mjs *mjs,
+                                              mjs_val_t obj,
+                                              const char *name,
+                                              size_t name_len);
+
+MJS_PRIVATE struct mjs_node *mjs_get_own_node_v(struct mjs *mjs,
+                                                mjs_val_t obj,
+                                                mjs_val_t key);
+
+mjs_val_t mjs_next_node(struct mjs *mjs, mjs_val_t obj, mjs_val_t *iterator);
 
 /*
  * A worker function for `mjs_set()` and `mjs_set_v()`: it takes name as both

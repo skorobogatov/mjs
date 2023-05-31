@@ -10,4 +10,4 @@ let f = function(obj, key) {
 	return false;
 };
 
-s === 'cba' && sum === 6 && f(o, 'x') === false && f(o, 'b') === true;
+s === 'bac' && sum === 6 && f(o, 'x') === false && f(o, 'b') === true;

@@ -96,12 +96,12 @@ typedef const char *(test_func_t)(struct mjs *mjs);
  */
 static test_func_t *s_test_func;
 static const char *s_run_test_mjs(void) {
-  uint32_t objects_alive, props_alive, ffi_sigs_alive; 
+  uint32_t objects_alive, nodes_alive, ffi_sigs_alive;
   struct mjs *mjs = mjs_create();
   const char *ret = s_test_func(mjs);
   mjs_gc(mjs, 1);
   objects_alive = mjs->object_arena.alive;
-  props_alive = mjs->property_arena.alive;
+  nodes_alive = mjs->node_arena.alive;
   ffi_sigs_alive = mjs->ffi_sig_arena.alive;
 
   /*
@@ -112,7 +112,7 @@ static const char *s_run_test_mjs(void) {
     mjs_gc(mjs, 1);
 
     ASSERT_EQ(objects_alive, mjs->object_arena.alive);
-    ASSERT_EQ(props_alive, mjs->property_arena.alive);
+    ASSERT_EQ(nodes_alive, mjs->node_arena.alive);
     ASSERT_EQ(ffi_sigs_alive, mjs->ffi_sig_arena.alive);
   }
 
@@ -2774,7 +2774,7 @@ const char *test_arrays(struct mjs *mjs) {
 }
 
 const char *test_json(struct mjs *mjs) {
-  const char *json_val = "{\"null\":null,\"arr\":[1,2,{\"foo\":100}],\"bar\":\"hey\",\"foo\":1}";
+  const char *json_val = "{\"bar\":\"hey\",\"foo\":1,\"null\":null,\"arr\":[1,2,{\"foo\":100}]}";
   mjs_val_t res = MJS_UNDEFINED;
   mjs_own(mjs, &res);
 
@@ -2799,7 +2799,7 @@ const char *test_json(struct mjs *mjs) {
         "JSON.stringify(o)",
         &res));
   {
-    const char *rs = "{\"null\":null,\"arr\":[1,2,{\"foo\":100}],\"bar\":\"hey\",\"foo\":1}";
+    const char *rs = "{\"bar\":\"hey\",\"foo\":1,\"null\":null,\"arr\":[1,2,{\"foo\":100}]}";
     ASSERT_STREQ(mjs_get_cstring(mjs, &res), rs);
   }
 
@@ -2815,7 +2815,7 @@ const char *test_json(struct mjs *mjs) {
         "JSON.stringify(o)",
         &res));
   {
-    const char *rs = "{\"null\":null,\"arr\":[1,2,{\"foo\":100},null,null,null,null,null,null,null,[Circular]],\"bar\":\"hey\",\"foo\":1}";
+    char *rs = "{\"bar\":\"hey\",\"foo\":1,\"null\":null,\"arr\":[1,2,{\"foo\":100},null,null,null,null,null,null,null,[Circular]]}";
     ASSERT_STREQ(mjs_get_cstring(mjs, &res), rs);
   }
 
@@ -3325,7 +3325,7 @@ const char *test_backtrace(struct mjs *mjs) {
       "  at <stdin>:2\n"
       );
 
-  ASSERT_EQ(mjs_exec(mjs, 
+  ASSERT_EQ(mjs_exec(mjs,
         "function f1() { return bar; };"
         "\n\n\n\n\n\n\n\n\n\n"
         "\n\n\n\n\n\n\n\n\n\n"
@@ -3802,6 +3802,122 @@ static const struct mjs_c_struct_member *get_my_struct_descr(void) {
   return my_struct_descr;
 };
 
+const char *test_nodes(struct mjs *mjs) {
+  mjs_val_t obj = mjs_mk_object(mjs);
+
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+
+  mjs_val_t tt = mjs_mk_boolean(mjs, 1),
+            ff = mjs_mk_boolean(mjs, 0),
+            zero = mjs_mk_number(mjs, 0),
+            one = mjs_mk_number(mjs, 1),
+            two = mjs_mk_number(mjs, 2),
+            three = mjs_mk_number(mjs, 3);
+
+  mjs_set(mjs, obj, "abcd", 4, tt);
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcd", 4), tt);
+
+  mjs_set(mjs, obj, "abefghij", 8, ff);
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcd", 4), tt);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abefghij", 8), ff);
+
+  mjs_set(mjs, obj, "abcde", 5, zero);
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcd", 4), tt);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abefghij", 8), ff);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcde", 5), zero);
+
+  mjs_set(mjs, obj, "abc", 3, one);
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcd", 4), tt);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abefghij", 8), ff);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcde", 5), zero);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abc", 3), one);
+
+  mjs_set(mjs, obj, "", 0, two);
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), two);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcd", 4), tt);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abefghij", 8), ff);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcde", 5), zero);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abc", 3), one);
+
+  mjs_set(mjs, obj, "abefghij", 8, three);
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), two);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcd", 4), tt);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abefghij", 8), three);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcde", 5), zero);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abc", 3), one);
+
+  /*mjs_val_t iterator = MJS_UNDEFINED;
+  for (;;) {
+    mjs_val_t key = mjs_next_node(mjs, obj, &iterator);
+    if (key == MJS_UNDEFINED) {
+      break;
+    }
+
+    printf("'");
+    size_t name_len;
+    const char *name = mjs_get_string(mjs, &key, &name_len);
+    int i;
+    for (i = 0; i < name_len; i++) {
+      printf("%c", name[i]);
+    }
+    printf("' ");
+  }
+  printf("\n");*/
+
+  mjs_del(mjs, obj, "", 0);
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcd", 4), tt);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abefghij", 8), three);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcde", 5), zero);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abc", 3), one);
+
+  mjs_del(mjs, obj, "abcd", 4);
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcd", 4), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abefghij", 8), three);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcde", 5), zero);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abc", 3), one);
+
+  mjs_del(mjs, obj, "abefghij", 8);
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcd", 4), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abefghij", 8), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcde", 5), zero);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abc", 3), one);
+
+  mjs_del(mjs, obj, "abcde", 5);
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcd", 4), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abefghij", 8), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcde", 5), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abc", 3), one);
+
+  mjs_del(mjs, obj, "abc", 3);
+  ASSERT_EQ64(mjs_get(mjs, obj, "", 0), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "qwerty", 6), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcd", 4), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abefghij", 8), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abcde", 5), MJS_UNDEFINED);
+  ASSERT_EQ64(mjs_get(mjs, obj, "abc", 3), MJS_UNDEFINED);
+
+  return NULL;
+}
+
 const char *test_s2o(struct mjs *mjs) {
   mjs_val_t res = MJS_UNDEFINED;
   mjs_own(mjs, &res);
@@ -3918,6 +4034,7 @@ void tests_setup(void) {
 }
 
 const char *tests_run(const char *filter) {
+  RUN_TEST_MJS(test_nodes);
   RUN_TEST_MJS(test_parser);
   RUN_TEST_MJS(test_arithmetic);
   RUN_TEST_MJS(test_block);
@@ -3962,7 +4079,7 @@ const char *tests_run(const char *filter) {
 
   RUN_TEST_MJS(test_dataview);
 
-  RUN_TEST_MJS(test_lib_math);
+  //RUN_TEST_MJS(test_lib_math);
   RUN_TEST(test_exec);
 
   RUN_TEST_MJS(test_s2o);

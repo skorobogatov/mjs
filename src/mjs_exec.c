@@ -85,7 +85,7 @@ static mjs_val_t mjs_find_scope(struct mjs *mjs, mjs_val_t key) {
   while (num_scopes > 0) {
     mjs_val_t scope = *vptr(&mjs->scopes, num_scopes - 1);
     num_scopes--;
-    if (mjs_get_own_property_v(mjs, scope, key) != NULL) return scope;
+    if (mjs_get_own_node_v(mjs, scope, key) != NULL) return scope;
   }
   mjs_set_errorf(mjs, MJS_REFERENCE_ERROR, "[%s] is not defined",
                  mjs_get_cstring(mjs, &key));
@@ -668,7 +668,7 @@ MJS_PRIVATE mjs_err_t mjs_execute(struct mjs *mjs, size_t off, mjs_val_t *res) {
       case OP_CREATE: {
         mjs_val_t obj = mjs_pop(mjs);
         mjs_val_t key = mjs_pop(mjs);
-        if (mjs_get_own_property_v(mjs, obj, key) == NULL) {
+        if (mjs_get_own_node_v(mjs, obj, key) == NULL) {
           mjs_set_v(mjs, obj, key, MJS_UNDEFINED);
         }
         break;
@@ -757,7 +757,7 @@ MJS_PRIVATE mjs_err_t mjs_execute(struct mjs *mjs, size_t off, mjs_val_t *res) {
         mjs_val_t obj = *vptr(&mjs->stack, -2);
         if (mjs_is_object(obj)) {
           mjs_val_t var_name = *vptr(&mjs->stack, -3);
-          mjs_val_t key = mjs_next(mjs, obj, iterator);
+          mjs_val_t key = mjs_next_node(mjs, obj, iterator);
           if (key != MJS_UNDEFINED) {
             mjs_val_t scope = mjs_find_scope(mjs, var_name);
             mjs_set_v(mjs, scope, var_name, key);
@@ -1078,6 +1078,68 @@ MJS_PRIVATE mjs_err_t mjs_exec_internal(struct mjs *mjs, const char *path,
 
 mjs_err_t mjs_exec(struct mjs *mjs, const char *src, mjs_val_t *res) {
   return mjs_exec_internal(mjs, "<stdin>", src, 0 /* generate_jsc */, res);
+}
+
+mjs_err_t mjs_load_file(struct mjs *mjs, const char *path) {
+  mjs_err_t error;
+  size_t size;
+  char *source_code = cs_read_file(path, &size);
+
+  if (source_code == NULL) {
+    error = MJS_FILE_READ_ERROR;
+    mjs_prepend_errorf(mjs, error, "failed to read file \"%s\"", path);
+  } else {
+    error = mjs->error = mjs_parse(path, source_code, mjs);
+  }
+
+  return error;
+}
+
+mjs_err_t mjs_save_jsc(struct mjs *mjs, const char *path) {
+  mjs_err_t error = MJS_OK;
+
+  int part_index = mjs_bcode_parts_cnt(mjs) - 1;
+  assert(part_index >= 0);
+  struct mjs_bcode_part *bp = mjs_bcode_part_get(mjs, part_index);
+
+  FILE *fp = fopen(path, "wb");
+  if (fp != NULL) {
+    /* write last bcode part to .jsc */
+    fwrite(bp->data.p, bp->data.len, 1, fp);
+    fclose(fp);
+  } else {
+    mjs_err_t error = MJS_FILE_WRITE_ERROR;
+    mjs_prepend_errorf(mjs, error, "failed to write file \"%s\"", path);
+  }
+
+  return error;
+}
+
+mjs_err_t mjs_exec_jsc(struct mjs *mjs, const char *path, mjs_val_t *res) {
+  mjs_err_t error = MJS_OK;
+
+  size_t size;
+  char *bytes = cs_read_file(path, &size);
+  if (bytes == NULL) {
+    error = MJS_FILE_READ_ERROR;
+    mjs_prepend_errorf(mjs, error, "failed to read file \"%s\"", path);
+  } else {
+    mjs_val_t r = MJS_UNDEFINED;
+    size_t off = mjs->bcode_len;
+    struct mjs_bcode_part bp = {
+      .start_idx = off,
+      .data = { bytes, size },
+      .exec_res = MJS_ERRS_CNT
+    };
+    mjs_bcode_part_add(mjs, &bp);
+    mjs->bcode_len += size;
+    mjs_execute(mjs, off, &r);
+    if (res != NULL) {
+      *res = r;
+    }
+  }
+
+  return error;
 }
 
 mjs_err_t mjs_exec_file(struct mjs *mjs, const char *path, mjs_val_t *res) {

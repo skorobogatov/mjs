@@ -38,7 +38,8 @@ mjs_val_t mjs_mk_object(struct mjs *mjs) {
     return MJS_NULL;
   }
   (void) mjs;
-  o->properties = NULL;
+  o->tree = NULL;
+  o->prop_count = 0;
   return mjs_object_to_value(o);
 }
 
@@ -47,73 +48,78 @@ int mjs_is_object(mjs_val_t v) {
          (v & MJS_TAG_MASK) == MJS_TAG_ARRAY;
 }
 
-MJS_PRIVATE struct mjs_property *mjs_get_own_property(struct mjs *mjs,
-                                                      mjs_val_t obj,
-                                                      const char *name,
-                                                      size_t len) {
-  struct mjs_property *p;
-  struct mjs_object *o;
+MJS_PRIVATE struct mjs_node *mjs_descend(struct mjs_node *x,
+                                         const char *name,
+                                         size_t name_len) {
+  uintptr_t child;
+  do {
+    struct mjs_position pos = x->pos;
+    uint8_t c = pos.byte < name_len ? (uint8_t)(name[pos.byte]) : 0;
+    int dir = (1 + (int)(pos.mask | c)) >> 8;
+    child = x->child[dir];
+    x = DECODE_NODE(child);
+  } while (IS_INNER_NODE(child));
+  return x;
+}
 
+MJS_PRIVATE struct mjs_node *mjs_get_own_node(struct mjs *mjs,
+                                              mjs_val_t obj,
+                                              const char *name,
+                                              size_t name_len) {
   if (!mjs_is_object(obj)) {
     return NULL;
   }
 
-  o = get_object_struct(obj);
+  struct mjs_object *o = get_object_struct(obj);
+  struct mjs_node *leaf;
 
-  if (len <= 5) {
-    mjs_val_t ss = mjs_mk_string(mjs, name, len, 1);
-    for (p = o->properties; p != NULL; p = p->next) {
-      if (p->name == ss) return p;
-    }
-  } else {
-    for (p = o->properties; p != NULL; p = p->next) {
-      if (mjs_strcmp(mjs, &p->name, name, len) == 0) return p;
-    }
-    return p;
+  switch (o->prop_count) {
+  case 0:
+    return 0;
+  case 1:
+    leaf = o->tree;
+    break;
+  default:
+    leaf = mjs_descend(o->tree, name, name_len);
   }
 
-  return NULL;
+  if (name_len <= 5) {
+    mjs_val_t ss = mjs_mk_string(mjs, name, name_len, 1);
+    if (leaf->name != ss) {
+      return NULL;
+    }
+  } else {
+    if (mjs_strcmp(mjs, &leaf->name, name, name_len) != 0) {
+      return NULL;
+    }
+  }
+
+  return leaf;
 }
 
-MJS_PRIVATE struct mjs_property *mjs_get_own_property_v(struct mjs *mjs,
-                                                        mjs_val_t obj,
-                                                        mjs_val_t key) {
+MJS_PRIVATE struct mjs_node *mjs_get_own_node_v(struct mjs *mjs,
+                                                mjs_val_t obj,
+                                                mjs_val_t key) {
   size_t n;
   char *s = NULL;
   int need_free = 0;
-  struct mjs_property *p = NULL;
+  struct mjs_node *leaf = NULL;
   mjs_err_t err = mjs_to_string(mjs, &key, &s, &n, &need_free);
   if (err == MJS_OK) {
-    p = mjs_get_own_property(mjs, obj, s, n);
+    leaf = mjs_get_own_node(mjs, obj, s, n);
   }
   if (need_free) free(s);
-  return p;
-}
-
-MJS_PRIVATE struct mjs_property *mjs_mk_property(struct mjs *mjs,
-                                                 mjs_val_t name,
-                                                 mjs_val_t value) {
-  struct mjs_property *p = new_property(mjs);
-  p->next = NULL;
-  p->name = name;
-  p->value = value;
-  return p;
+  return leaf;
 }
 
 mjs_val_t mjs_get(struct mjs *mjs, mjs_val_t obj, const char *name,
                   size_t name_len) {
-  struct mjs_property *p;
-
   if (name_len == (size_t) ~0) {
     name_len = strlen(name);
   }
 
-  p = mjs_get_own_property(mjs, obj, name, name_len);
-  if (p == NULL) {
-    return MJS_UNDEFINED;
-  } else {
-    return p->value;
-  }
+  struct mjs_node *leaf = mjs_get_own_node(mjs, obj, name, name_len);
+  return leaf == NULL ? MJS_UNDEFINED : leaf->value;
 }
 
 mjs_val_t mjs_get_v(struct mjs *mjs, mjs_val_t obj, mjs_val_t name) {
@@ -137,11 +143,18 @@ mjs_val_t mjs_get_v(struct mjs *mjs, mjs_val_t obj, mjs_val_t name) {
 }
 
 mjs_val_t mjs_get_v_proto(struct mjs *mjs, mjs_val_t obj, mjs_val_t key) {
-  struct mjs_property *p;
-  mjs_val_t pn = mjs_mk_string(mjs, MJS_PROTO_PROP_NAME, ~0, 1);
-  if ((p = mjs_get_own_property_v(mjs, obj, key)) != NULL) return p->value;
-  if ((p = mjs_get_own_property_v(mjs, obj, pn)) == NULL) return MJS_UNDEFINED;
-  return mjs_get_v_proto(mjs, p->value, key);
+  mjs_val_t res;
+
+  struct mjs_node *leaf = mjs_get_own_node_v(mjs, obj, key);
+  if (leaf != NULL) {
+    res = leaf->value;
+  } else {
+    mjs_val_t pn = mjs_mk_string(mjs, MJS_PROTO_PROP_NAME, ~0, 1);
+    leaf = mjs_get_own_node_v(mjs, obj, pn);
+    res = leaf ? mjs_get_v_proto(mjs, leaf->value, key) : MJS_UNDEFINED;
+  }
+
+  return res;
 }
 
 mjs_err_t mjs_set(struct mjs *mjs, mjs_val_t obj, const char *name,
@@ -158,108 +171,205 @@ mjs_err_t mjs_set_v(struct mjs *mjs, mjs_val_t obj, mjs_val_t name,
 MJS_PRIVATE mjs_err_t mjs_set_internal(struct mjs *mjs, mjs_val_t obj,
                                        mjs_val_t name_v, char *name,
                                        size_t name_len, mjs_val_t val) {
-  mjs_err_t rcode = MJS_OK;
-
-  struct mjs_property *p;
+  if (!mjs_is_object(obj)) {
+    return MJS_REFERENCE_ERROR;
+  }
 
   int need_free = 0;
 
   if (name == NULL) {
     /* Pointer was not provided, so obtain one from the name_v. */
-    rcode = mjs_to_string(mjs, &name_v, &name, &name_len, &need_free);
+    mjs_err_t rcode = mjs_to_string(mjs, &name_v, &name, &name_len, &need_free);
     if (rcode != MJS_OK) {
-      goto clean;
+      return rcode;
     }
   } else {
-    /*
-     * Pointer was provided, so we ignore name_v. Here we set it to undefined,
-     * and the actual value will be calculated later if needed.
-     */
+    if (name_len == ~((size_t)0)) {
+      name_len = strlen(name);
+    }
     name_v = MJS_UNDEFINED;
   }
 
-  p = mjs_get_own_property(mjs, obj, name, name_len);
+  struct mjs_node *leaf, *new_leaf;
+  uintptr_t root;
+  struct mjs_object *o = get_object_struct(obj);
 
-  if (p == NULL) {
-    struct mjs_object *o;
-    if (!mjs_is_object(obj)) {
-      return MJS_REFERENCE_ERROR;
-    }
-
-    /*
-     * name_v might be not a string here. In this case, we need to create a new
-     * `name_v`, which will be a string.
-     */
-    if (!mjs_is_string(name_v)) {
-      name_v = mjs_mk_string(mjs, name, name_len, 1);
-    }
-
-    p = mjs_mk_property(mjs, name_v, val);
-
-    o = get_object_struct(obj);
-    p->next = o->properties;
-    o->properties = p;
+  switch (o->prop_count) {
+  case 0:
+    new_leaf = new_node(mjs);
+    new_leaf->parent = NULL;
+    new_leaf->value = val;
+    o->tree = new_leaf;
+    goto save_name_v;
+  case 1:
+    leaf = o->tree;
+    root = ENCODE_LEAF_NODE(leaf);
+    break;
+  default:
+    leaf = mjs_descend(o->tree, name, name_len);
+    root = ENCODE_INNER_NODE(o->tree);
   }
 
-  p->value = val;
+  size_t leaf_name_len;
+  const char *leaf_name = mjs_get_string(mjs, &leaf->name, &leaf_name_len);
+
+  size_t min_len = name_len < leaf_name_len ? name_len : leaf_name_len;
+  size_t byte = 0;
+  while (byte < min_len && name[byte] == leaf_name[byte]) {
+    byte++;
+  }
+
+  if (byte == min_len && name_len == leaf_name_len) {
+    leaf->value = val;
+    goto clean;
+  }
+
+  uint8_t c = byte < name_len ? name[byte] : 0;
+  uint8_t leaf_c = byte < leaf_name_len ? leaf_name[byte] : 0;
+
+  int n = __builtin_ctz(c ^ leaf_c);
+  struct mjs_position new_pos = { ~(1 << n), byte };
+  int new_dir = (leaf_c >> n) & 1;
+
+  struct mjs_node *new_inner_node = new_node(mjs);
+  new_inner_node->pos = new_pos;
+
+  new_leaf = new_node(mjs);
+  new_leaf->parent = new_inner_node;
+  new_leaf->value = val;
+
+  new_inner_node->child[1 - new_dir] = ENCODE_LEAF_NODE(new_leaf);
+
+  struct mjs_node *x;
+  uintptr_t *where = &root;
+  while (IS_INNER_NODE(*where)) {
+    struct mjs_node *x = DECODE_NODE(*where);
+    struct mjs_position pos = x->pos;
+    if (POSITION_LESS(new_pos, pos)) {
+      break;
+    }
+
+    c = pos.byte < name_len ? (uint8_t)(name[pos.byte]) : 0;
+    int dir = (1 + (int)(pos.mask | c)) >> 8;
+    where = &(x->child[dir]);
+  }
+
+  new_inner_node->child[new_dir] = *where;
+  x = DECODE_NODE(*where);
+  new_inner_node->parent = x->parent;
+  x->parent = new_inner_node;
+  *where = ENCODE_INNER_NODE(new_inner_node);
+  o->tree = DECODE_NODE(root);
+
+save_name_v:
+  if (!mjs_is_string(name_v)) {
+    /* We intentially convert 'name' into value here, because 'mjs_mk_string'
+       function can reallocate string buffer, thus invalidating the 'name'
+       pointer! */
+    new_leaf->name = mjs_mk_string(mjs, name, name_len, 1);
+  } else {
+    new_leaf->name = name_v;
+  }
+
+  o->prop_count++;
 
 clean:
   if (need_free) {
     free(name);
-    name = NULL;
   }
-  return rcode;
-}
-
-MJS_PRIVATE void mjs_destroy_property(struct mjs_property **p) {
-  *p = NULL;
+  return MJS_OK;
 }
 
 /*
  * See comments in `object_public.h`
  */
 int mjs_del(struct mjs *mjs, mjs_val_t obj, const char *name, size_t len) {
-  struct mjs_property *prop, *prev;
-
   if (!mjs_is_object(obj)) {
     return -1;
   }
+
   if (len == (size_t) ~0) {
     len = strlen(name);
   }
-  for (prev = NULL, prop = get_object_struct(obj)->properties; prop != NULL;
-       prev = prop, prop = prop->next) {
-    size_t n;
-    const char *s = mjs_get_string(mjs, &prop->name, &n);
-    if (n == len && strncmp(s, name, len) == 0) {
-      if (prev) {
-        prev->next = prop->next;
-      } else {
-        get_object_struct(obj)->properties = prop->next;
-      }
-      mjs_destroy_property(&prop);
-      return 0;
-    }
+
+  struct mjs_node *x = mjs_get_own_node(mjs, obj, name, len);
+  if (x == NULL) {
+    return -1;
   }
-  return -1;
+
+  struct mjs_object *o = get_object_struct(obj);
+  struct mjs_node *y = x->parent;
+  if (y == NULL) {
+    o->tree = NULL;
+  } else {
+    int dir = y->child[0] == ENCODE_LEAF_NODE(x) ? 1 : 0;
+    uintptr_t encoded_z = y->child[dir];
+    struct mjs_node *z = DECODE_NODE(encoded_z);
+    struct mjs_node *parent = y->parent;
+    if (parent == NULL) {
+      o->tree = z;
+    } else {
+      dir = parent->child[0] == ENCODE_INNER_NODE(y) ? 0 : 1;
+      parent->child[dir] = encoded_z;
+    }
+    z->parent = parent;
+  }
+  o->prop_count--;
+  return 0;
 }
 
-mjs_val_t mjs_next(struct mjs *mjs, mjs_val_t obj, mjs_val_t *iterator) {
-  struct mjs_property *p = NULL;
+mjs_val_t mjs_next_node(struct mjs *mjs, mjs_val_t obj, mjs_val_t *iterator) {
+  struct mjs_node *x, *y;
+  uintptr_t encoded_x;
   mjs_val_t key = MJS_UNDEFINED;
 
   if (*iterator == MJS_UNDEFINED) {
     struct mjs_object *o = get_object_struct(obj);
-    p = o->properties;
-  } else {
-    p = ((struct mjs_property *) get_ptr(*iterator))->next;
-  }
+    switch (o->prop_count) {
+    case 0:
+      *iterator = MJS_UNDEFINED;
+      break;
+    case 1:
+      key = o->tree->name;
+      *iterator = mjs_mk_foreign(mjs, o->tree);
+      break;
+    default:
+      x = o->tree;
+      do {
+        encoded_x = x->child[0];
+        x = DECODE_NODE(encoded_x);
+      } while (IS_INNER_NODE(encoded_x));
 
-  if (p == NULL) {
-    *iterator = MJS_UNDEFINED;
+      key = x->name;
+      *iterator = mjs_mk_foreign(mjs, x);
+    }
   } else {
-    key = p->name;
-    *iterator = mjs_mk_foreign(mjs, p);
+    x = (struct mjs_node*)get_ptr(*iterator);
+    encoded_x = ENCODE_LEAF_NODE(x);
+
+    for (;;) {
+      y = x->parent;
+      if (y == NULL) {
+        *iterator = MJS_UNDEFINED;
+        break;
+      }
+
+      if (encoded_x == y->child[0]) {
+        encoded_x = y->child[1];
+        x = DECODE_NODE(encoded_x);
+        while (IS_INNER_NODE(encoded_x)) {
+          encoded_x = x->child[0];
+          x = DECODE_NODE(encoded_x);
+        }
+
+        key = x->name;
+        *iterator = mjs_mk_foreign(mjs, x);
+        break;
+      }
+
+      x = y;
+      encoded_x = ENCODE_INNER_NODE(x);
+    }
   }
 
   return key;
