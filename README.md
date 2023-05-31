@@ -3,6 +3,22 @@ mJS: Restricted JavaScript engine
 
 [![License](https://img.shields.io/badge/license-GPL_2-green.svg)](https://github.com/cesanta/mjs/blob/master/LICENSE)
 
+# Fork of [cesanta/mjs](https://github.com/cesanta/mjs)
+
+This repository is a fork of the original [cesanta/mjs](https://github.com/cesanta/mjs) with the following changes:
+
+1. Property lists in JavaScript objects were replaced by prefix trees
+   (critbit trees with parent links, to be more exact).
+
+   This change dramatically improves object attributes access time,
+   making it O(k), where k is the length of attribute name in bits.
+
+2. Command line arguments of `mjs` utility were redesigned, allowing to compile
+   JavaScript files to bytecode without running them, as well as running
+   compiled bytecode without original JavaScript source file.
+
+3. Makefile was simplified by eliminating docker support.
+
 # Overview
 
 mJS is designed for microcontrollers with limited resources. Main design
@@ -14,7 +30,7 @@ implements a strict subset of ES6 (JavaScript version 6):
 
 On 32-bit ARM mJS engine takes about 50k of flash memory, and less than 1k
 of RAM (see [intro article](https://mongoose-os.com/blog/mjs-a-new-approach-to-embedded-scripting/)).
-mJS is part of [MongooseOS](https://mongoose-os.com), 
+mJS is part of [MongooseOS](https://mongoose-os.com),
 where it enables scripting for IoT devices.
 
 # Restrictions
